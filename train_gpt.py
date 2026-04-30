@@ -779,10 +779,8 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(self, x, weight=None):
-        # When `weight` is provided, F.rms_norm fuses (x/rms(x)) * weight inside
-        # the kernel — no extra (B·T·H) pass. LayerRoPE folds γ_eff,input here.
-        return F.rms_norm(x, (x.size(-1),), weight=weight, eps=self.eps)
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
 class DepthGates(nn.Module):
@@ -1303,7 +1301,7 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
-            self.attn_norm(x_in, weight=g_in_attn.to(dtype=x_in.dtype)),
+            g_in_attn.to(dtype=x_in.dtype)[None, None, :] * self.attn_norm(x_in),
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -1311,7 +1309,7 @@ class Block(nn.Module):
         x_out = x_in + g_res_attn.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + g_res_mlp.to(dtype=x_out.dtype)[
             None, None, :
-        ] * self.mlp(self.mlp_norm(x_out, weight=g_in_mlp.to(dtype=x_out.dtype)), up_w, down_w)
+        ] * self.mlp(g_in_mlp.to(dtype=x_out.dtype)[None, None, :] * self.mlp_norm(x_out), up_w, down_w)
         return x_out
 
 class GPT(nn.Module):
@@ -1497,14 +1495,14 @@ class GPT(nn.Module):
         mix = block.resid_mix.to(dtype=lane0.dtype)
         attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
-            block.attn_norm(attn_read, weight=g_in_attn.to(dtype=attn_read.dtype)),
+            g_in_attn.to(dtype=attn_read.dtype)[None, None, :] * block.attn_norm(attn_read),
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
         )
         attn_out = g_res_attn.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
         mlp_out = g_res_mlp.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
-            block.mlp_norm(mlp_read, weight=g_in_mlp.to(dtype=lane1.dtype)), up_w, down_w
+            g_in_mlp.to(dtype=lane1.dtype)[None, None, :] * block.mlp_norm(mlp_read), up_w, down_w
         )
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
@@ -1733,7 +1731,7 @@ class GPT(nn.Module):
         g_in_attn, g_in_mlp, g_res_attn, g_res_mlp = gates
         mix = block.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = block.attn_norm(x_in, weight=g_in_attn.to(dtype=x_in.dtype))
+        n = g_in_attn.to(dtype=x_in.dtype)[None, None, :] * block.attn_norm(x_in)
         attn = block.attn
         bsz, seqlen, dim = n.shape
         # Keep raw Q for AttnOutGate src='q' (matches forward path semantics).
@@ -1782,7 +1780,7 @@ class GPT(nn.Module):
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         x_out = x_in + g_res_attn.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        mlp_n = block.mlp_norm(x_out, weight=g_in_mlp.to(dtype=x_out.dtype))
+        mlp_n = g_in_mlp.to(dtype=x_out.dtype)[None, None, :] * block.mlp_norm(x_out)
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
@@ -1797,7 +1795,7 @@ class GPT(nn.Module):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
         attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
-        n = block.attn_norm(attn_read, weight=g_in_attn.to(dtype=attn_read.dtype))
+        n = g_in_attn.to(dtype=attn_read.dtype)[None, None, :] * block.attn_norm(attn_read)
         attn = block.attn
         bsz, seqlen, dim = n.shape
         q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
@@ -1844,7 +1842,7 @@ class GPT(nn.Module):
             attn_out = attn_out + lora.o_loras[slot](n)
         attn_out = g_res_attn.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
-        mlp_n = block.mlp_norm(mlp_read, weight=g_in_mlp.to(dtype=mlp_read.dtype))
+        mlp_n = g_in_mlp.to(dtype=mlp_read.dtype)[None, None, :] * block.mlp_norm(mlp_read)
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
