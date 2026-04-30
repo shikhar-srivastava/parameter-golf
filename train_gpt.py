@@ -269,6 +269,12 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.026))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    # LayerRoPE: optional separate LR for DepthGates parameters (γ vectors + 16
+    # schedule scalars). Defaults to scalar_lr — set GATE_LR to give the gate
+    # group a different LR without disturbing the rest of the scalar AdamW group
+    # (attn_gate_w, q_gain, skip_gates, parallel_lambdas, smear_gate, resid_mix,
+    # etc., all of which the record stack tuned at scalar_lr=0.02).
+    gate_lr = float(os.environ.get("GATE_LR", os.environ.get("SCALAR_LR", 0.02)))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.97))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(
@@ -2245,10 +2251,14 @@ class Optimizers:
             scalar_params.append(base_model.smear_lambda)
         # LayerRoPE depth-gate params live on GPT root (depth_gates submodule).
         # 4×H shared γ vectors + 16 schedule scalars (α/β/α_rot/β_rot per gate position)
-        # — all 1D/0D, all FP32, all routed to the scalar AdamW group.
+        # — all 1D/0D, all FP32. Split off into their own AdamW param group so
+        # h.gate_lr can override h.scalar_lr without disturbing the rest of the
+        # scalar group (which was tuned for the record stack at scalar_lr=0.02).
+        # Defaults: gate_lr=scalar_lr → bit-identical to the pre-split behavior.
+        gate_params = []
         if hasattr(base_model, "depth_gates"):
             for p in base_model.depth_gates.parameters():
-                scalar_params.append(p)
+                gate_params.append(p)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [
             {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
@@ -2270,8 +2280,15 @@ class Optimizers:
         )
         for group in self.optimizer_muon.param_groups:
             group["base_lr"] = h.matrix_lr
+        scalar_param_groups = [
+            {"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}
+        ]
+        if gate_params:
+            scalar_param_groups.append(
+                {"params": gate_params, "lr": h.gate_lr, "base_lr": h.gate_lr}
+            )
         self.optimizer_scalar = torch.optim.AdamW(
-            [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
+            scalar_param_groups,
             betas=(h.beta1, h.beta2),
             eps=h.adam_eps,
             weight_decay=h.adam_wd,
@@ -2284,6 +2301,7 @@ class Optimizers:
         ]
         self.replicated_params = list(tok_params[0]["params"])
         self.replicated_params.extend(scalar_params)
+        self.replicated_params.extend(gate_params)
         self.replicated_large_params = []
         self.replicated_packed_params = []
         for p in self.replicated_params:
