@@ -932,6 +932,85 @@ class DepthGates(nn.Module):
             ),
         )
 
+    def forward_all(self):
+        """Vectorized γ_eff for all 4 positions and all max_steps visits in one
+        FP32 kernel graph. Returns shape (4, max_steps, H) FP32, with position
+        order matching POS = (input_attn, input_mlp, residual_attn, residual_mlp).
+
+        Equivalent to stacking forward(k) for k in range(max_steps) along a new
+        leading dim and transposing position to dim 0 — but as one fused compute
+        graph instead of 4 * max_steps independent micro-launches. With looping
+        active (17 visits), this collapses ~700-950 µs-scale CUDA launches per
+        forward into a handful of kernels operating on (4, S, H/2) tensors.
+
+        out[p, k] is bit-identical (modulo kernel-internal accumulation order,
+        which is the same here — pure elementwise ops, no reductions) to
+        forward(k)[p].
+
+        NOT decorated with @torch.compile: this method is called from inside the
+        outer compiled_model graph; an inner @torch.compile would create a
+        compile boundary that prevents the outer compile from inlining and
+        fusing these ops with surrounding _forward_hidden code.
+        """
+        log_l = self.log_depths              # (S,) FP32
+        rope_freqs = self.rope_freqs         # (H/2,) FP32
+        # Stack first, .float() once on the stacked tensor — fewer kernel launches
+        # than .float() before stacking. After the global .bfloat16() at model
+        # build, gamma and gate scalars are bf16 (only log_depths/rope_freqs are
+        # restored to FP32 by restore_fp32_params); the .float() here re-upcasts
+        # for FP32-precision rotation, matching the gamma.float() pattern in _gate.
+        gamma = torch.stack([
+            self.gamma_input_attn,
+            self.gamma_input_mlp,
+            self.gamma_residual_attn,
+            self.gamma_residual_mlp,
+        ]).float()  # (4, H) FP32
+        a = torch.stack([
+            self.gate_alpha_input_attn,
+            self.gate_alpha_input_mlp,
+            self.gate_alpha_residual_attn,
+            self.gate_alpha_residual_mlp,
+        ]).float()  # (4,) FP32
+        b = torch.stack([
+            self.gate_beta_input_attn,
+            self.gate_beta_input_mlp,
+            self.gate_beta_residual_attn,
+            self.gate_beta_residual_mlp,
+        ]).float()  # (4,) FP32
+        ar = torch.stack([
+            self.gate_alpha_rot_input_attn,
+            self.gate_alpha_rot_input_mlp,
+            self.gate_alpha_rot_residual_attn,
+            self.gate_alpha_rot_residual_mlp,
+        ]).float()  # (4,) FP32
+        br = torch.stack([
+            self.gate_beta_rot_input_attn,
+            self.gate_beta_rot_input_mlp,
+            self.gate_beta_rot_residual_attn,
+            self.gate_beta_rot_residual_mlp,
+        ]).float()  # (4,) FP32
+        # mag[p, k]      = a[p] + b[p] * log_l[k]                       -> (4, S)
+        # theta[p, k, j] = exp(ar[p] + br[p] * log_l[k]) * rope_freqs[j] -> (4, S, H/2)
+        a_e = a.unsqueeze(-1)
+        b_e = b.unsqueeze(-1)
+        ar_e = ar.unsqueeze(-1)
+        br_e = br.unsqueeze(-1)
+        mag = a_e + b_e * log_l                                        # (4, S)
+        theta = torch.exp(ar_e + br_e * log_l).unsqueeze(-1) * rope_freqs  # (4, S, H/2)
+        # Pair-wise complex rotation: γ_eff,p,k = exp(mag) · R(θ) γ_p
+        g_re = gamma[:, 0::2]                                          # (4, H/2)
+        g_im = gamma[:, 1::2]                                          # (4, H/2)
+        R = torch.exp(mag).unsqueeze(-1)                               # (4, S, 1)
+        c = torch.cos(theta)                                           # (4, S, H/2)
+        s = torch.sin(theta)                                           # (4, S, H/2)
+        g_re_b = g_re.unsqueeze(1)                                     # (4, 1, H/2)
+        g_im_b = g_im.unsqueeze(1)                                     # (4, 1, H/2)
+        u_out = R * (g_re_b * c - g_im_b * s)                          # (4, S, H/2)
+        v_out = R * (g_re_b * s + g_im_b * c)                          # (4, S, H/2)
+        # Interleave (u, v) along last dim to reconstruct the original (H,)
+        # layout where channel pairs are (γ[2j], γ[2j+1]).
+        return torch.stack([u_out, v_out], dim=-1).flatten(-2)         # (4, S, H) FP32
+
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
@@ -1555,11 +1634,19 @@ class GPT(nn.Module):
         # accumulated-residual interpretation). In physical indexing, gate uses
         # log_depths[physical_layer_at_visit_k] (looped layers reuse the same gate).
         # See class DepthGates.
+        # Batched compute: one FP32 kernel graph for all 4 positions × max_steps
+        # visits, then a single FP32→bf16 cast at the boundary. Eliminates the
+        # ~700-950 micro-launches/step that the per-call form incurred.
+        all_gates = self.depth_gates.forward_all().to(torch.bfloat16)  # (4, S, H) bf16
         if self.depth_gate_indexing == "physical":
-            gates_per_step = [self.depth_gates(int(i)) for i in list(enc_iter) + list(dec_iter)]
+            visit_indices = list(enc_iter) + list(dec_iter)
         else:  # exec_step
             n_total = len(enc_iter) + len(dec_iter)
-            gates_per_step = [self.depth_gates(k) for k in range(n_total)]
+            visit_indices = list(range(n_total))
+        gates_per_step = [
+            (all_gates[0, k], all_gates[1, k], all_gates[2, k], all_gates[3, k])
+            for k in visit_indices
+        ]
         step = 0
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
@@ -1668,11 +1755,17 @@ class GPT(nn.Module):
         # LayerRoPE gates per visit (TTT path) — slot variable already mirrors
         # the exec_step index; we compute gates the same way as _forward_hidden
         # so train and TTT use identical gate values per position.
+        # Batched compute, same as _forward_hidden — see DepthGates.forward_all.
+        all_gates = self.depth_gates.forward_all().to(torch.bfloat16)  # (4, S, H) bf16
         if self.depth_gate_indexing == "physical":
-            gates_per_step = [self.depth_gates(int(i)) for i in enc_iter + dec_iter]
+            visit_indices = list(enc_iter) + list(dec_iter)
         else:  # exec_step
             n_total = len(enc_iter) + len(dec_iter)
-            gates_per_step = [self.depth_gates(k) for k in range(n_total)]
+            visit_indices = list(range(n_total))
+        gates_per_step = [
+            (all_gates[0, k], all_gates[1, k], all_gates[2, k], all_gates[3, k])
+            for k in visit_indices
+        ]
         slot = 0
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
